@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Command dispatch: run command path without creating CoPawAgent.
+"""Command dispatch（中文注释版）：run command path without creating CoPawAgent.
 
 Yields (Msg, last) compatible with query_handler stream.
 """
@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 def _get_last_user_text(msgs) -> str | None:
     """Extract last user message text from msgs (runtime message list)."""
+    # 目标：从运行时 message list 中，取出最后一条用户消息的“可展示文本”。
+    # 该函数同时兼容两种结构：
+    # - Msg 对象：直接使用 get_text_content()
+    # - dict 对象：尝试从 content/text 字段提取纯文本 block。
     if not msgs or len(msgs) == 0:
         return None
     last = msgs[-1]
@@ -43,6 +47,7 @@ def _get_last_user_text(msgs) -> str | None:
 
 def _is_conversation_command(query: str | None) -> bool:
     """True if query is a conversation command (/compact, /new, etc.)."""
+    # conversation command：以 `/` 开头，且命令名必须存在于 CommandHandler.SYSTEM_COMMANDS
     if not query or not query.startswith("/"):
         return False
     cmd = query.strip().lstrip("/").split()[0] if query.strip() else ""
@@ -51,6 +56,8 @@ def _is_conversation_command(query: str | None) -> bool:
 
 def _is_command(query: str | None) -> bool:
     """True if query is any known command (daemon or conversation)."""
+    # 先判断是否为 `/daemon ...`（parse_daemon_query 可解析则为 daemon 命令）
+    # 否则再判断是否为 conversation command
     if not query or not query.startswith("/"):
         return False
     if parse_daemon_query(query) is not None:
@@ -64,6 +71,13 @@ async def run_command_path(
     runner,
 ) -> AsyncIterator[tuple]:
     """Run command path and yield (msg, last) for each response.
+
+    中文说明：
+    - 该函数是“命令走捷径”的入口：当用户输入以 `/` 开头且被判定为命令，
+      则不进入 CoPawAgent 的完整推理/工具链路；
+    - daemon 路径：执行管理命令并 yield 一个 assistant Msg；
+    - conversation 路径：在轻量 memory（ReMeInMemoryMemory）上运行 CommandHandler，
+      然后把更新后的 memory 回写到 session（用于保持命令对话语义的一致性）。
 
     Args:
         request: AgentRequest (session_id, user_id, etc.)
@@ -83,6 +97,7 @@ async def run_command_path(
     # Daemon path
     parsed = parse_daemon_query(query)
     if parsed is not None:
+        # daemon 命令：这里不会创建 agent，只执行预设的 daemon handler。
         handler = DaemonCommandHandlerMixin()
         restart_cb = getattr(runner, "_restart_callback", None)
         if parsed[0] == "restart":
@@ -119,6 +134,7 @@ async def run_command_path(
 
     # Conversation path: lightweight memory + CommandHandler
     memory = ReMeInMemoryMemory(token_counter=_get_token_counter())
+    # 从 runner.session 加载历史 memory，然后在内存副本上处理命令
     session_state = await runner.session.get_session_state_dict(
         session_id=session_id,
         user_id=user_id,

@@ -1,5 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Skills hub client and install helpers."""
+"""Skills hub client and install helpers.
+
+中文说明：
+该模块实现“技能 Hub 客户端”能力：从多个不同来源（ClawHub/Skills.sh/GitHub/LobeHub/SkillsMP 等）下载技能包，
+并把包里的 `SKILL.md`、`references/`、`scripts/` 等文件内容“水合/规范化”为 `SkillService.create_skill` 可接受的数据结构。
+
+核心工作流概览：
+1) 解析用户给的 `bundle_url`，识别它属于哪种来源；
+2) 调用对应的 `_fetch_bundle_from_*` 获取 JSON/zip，并尽可能补齐文件内容；
+3) 通过 `_normalize_bundle` 将不同来源的返回结构统一成：
+   - `name`：技能名称
+   - `content`：SKILL.md 文本
+   - `references`：references/ 子目录树（dict 形式）
+   - `scripts`：scripts/ 子目录树（dict 形式）
+   - `extra_files`：除 references/scripts/ 外的额外文件（会写到技能根目录）
+4) 最后调用 `SkillService.create_skill` 写入目录结构，并在 `enable=True` 时同步到 active_skills。
+"""
 from __future__ import annotations
 
 import json
@@ -51,12 +67,16 @@ RETRYABLE_HTTP_STATUS = {
     504,
 }
 
+# Retry 相关策略：
+# - 对被认为“瞬时失败/限流/网关类问题”的 HTTP code 做有限次数重试；
+# - 重试间隔按指数退避（并带 cap），避免对上游造成压力。
 LOBEHUB_MAX_ZIP_ENTRIES = 256
 LOBEHUB_MAX_ZIP_BYTES = 5 * 1024 * 1024
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _hub_http_timeout() -> float:
+    # 从环境变量读取超时，支持按部署环境调参。
     raw = os.environ.get("COPAW_SKILLS_HUB_HTTP_TIMEOUT", "15")
     try:
         return max(3.0, float(raw))
@@ -65,6 +85,7 @@ def _hub_http_timeout() -> float:
 
 
 def _hub_http_retries() -> int:
+    # HTTP 重试次数（总尝试次数 = retries + 1）。
     raw = os.environ.get("COPAW_SKILLS_HUB_HTTP_RETRIES", "3")
     try:
         return max(0, int(raw))
@@ -73,6 +94,7 @@ def _hub_http_retries() -> int:
 
 
 def _hub_http_backoff_base() -> float:
+    # 指数退避的基础因子：delay ~= base * 2^(attempt-1)
     raw = os.environ.get("COPAW_SKILLS_HUB_HTTP_BACKOFF_BASE", "0.8")
     try:
         return max(0.1, float(raw))
@@ -81,6 +103,7 @@ def _hub_http_backoff_base() -> float:
 
 
 def _hub_http_backoff_cap() -> float:
+    # delay 的上限，防止无限膨胀导致用户等待过长。
     raw = os.environ.get("COPAW_SKILLS_HUB_HTTP_BACKOFF_CAP", "6")
     try:
         return max(0.5, float(raw))
@@ -89,12 +112,14 @@ def _hub_http_backoff_cap() -> float:
 
 
 def _compute_backoff_seconds(attempt: int) -> float:
+    # 注意：attempt 从 1 开始传入，因此 attempt=1 时 exponent 为 0，delay = base
     base = _hub_http_backoff_base()
     cap = _hub_http_backoff_cap()
     return min(cap, base * (2 ** max(0, attempt - 1)))
 
 
 def _hub_base_url() -> str:
+    # Hub 的默认域名可以被环境变量覆盖（便于自建/灰度）。
     return os.environ.get("COPAW_SKILLS_HUB_BASE_URL", "https://clawhub.ai")
 
 
@@ -131,6 +156,10 @@ def _join_url(base: str, path: str) -> str:
 
 
 def _build_request(full_url: str, accept: str) -> Request:
+    # 统一构造 HTTP 请求：
+    # - 写入 Accept/User-Agent，方便上游识别；
+    # - 如果请求目标是 GitHub API，并且环境里提供了 GITHUB_TOKEN/ GH_TOKEN，
+    #   则附加 Authorization 头，用于提升限流阈值并避免 403/rate-limit。
     req = Request(
         full_url,
         headers={
@@ -152,6 +181,9 @@ def _read_response_bytes(
     full_url: str,
     max_bytes: int | None = None,
 ) -> bytes:
+    # 将响应主体按块读取为 bytes，并在可能时提前检查：
+    # - Content-Length 是否超出 max_bytes（如果该头存在）；
+    # - 在读取过程中累计长度是否越界。
     if max_bytes is not None and max_bytes <= 0:
         raise ValueError("max_bytes must be greater than 0")
 
@@ -193,6 +225,12 @@ def _http_fetch(
     accept: str = "application/json",
     max_bytes: int | None = None,
 ) -> bytes:
+    # `_http_fetch` 是整个 hub 客户端的“通用请求器”：
+    # - 拼接 params -> querystring；
+    # - 构造 Request 并带上 Accept/Authorization（若适用）；
+    # - 对被标记为 RETRYABLE_HTTP_STATUS 的状态码，做有限重试 + 指数退避；
+    # - 对网络错误/超时也同样做重试；
+    # - 同时支持 max_bytes 保护：避免下载过大导致内存/磁盘压力。
     full_url = url
     if params:
         full_url = f"{url}?{urlencode(params)}"
@@ -202,6 +240,7 @@ def _http_fetch(
     timeout = _hub_http_timeout()
     attempts = retries + 1
     last_error: Exception | None = None
+    # attempt 从 1 开始，便于日志里呈现“第几次”。
     for attempt in range(1, attempts + 1):
         try:
             with urlopen(req, timeout=timeout) as resp:
@@ -214,6 +253,8 @@ def _http_fetch(
             last_error = e
             status = getattr(e, "code", 0) or 0
             if status == 403 and "api.github.com" in host:
+                # 兼容 GitHub 的 rate-limit：如果返回内容里包含 rate limit 信息，
+                # 则给出明确可操作的错误提示（要求用户配置 token）。
                 body = ""
                 try:
                     body = e.read().decode("utf-8", errors="ignore")
@@ -330,6 +371,10 @@ def _norm_search_items(data: Any) -> list[dict[str, Any]]:
 
 
 def _safe_path_parts(path: str) -> list[str] | None:
+    # 路径净化/安全边界：
+    # - 不允许绝对路径（以 "/" 开头）；
+    # - 不允许包含 "." / ".." 以避免路径穿越；
+    # - 返回 path 的“段列表”，供后续插入到 tree 结构中。
     if not path or path.startswith("/"):
         return None
     parts = [p for p in path.split("/") if p]
@@ -437,6 +482,13 @@ def _hydrate_clawhub_payload(
     """
     Convert ClawHub metadata responses into
     bundle-like payload with file contents.
+
+    中文说明：
+    ClawHub 的某些接口可能先返回“元数据”（例如 files 列表/版本信息），但不包含 SKILL.md 与 references/scripts 的具体内容。
+    这个函数会在缺失文件内容时，基于：
+    - `slug`（技能标识）
+    - `requested_version`（请求的版本/标签，必要时会从 latestVersion 抽取）
+    去调用另外的 hub endpoint 把实际文件文本抓回来，最终把数据“水合”为统一的 bundle-like 结构。
     """
     if _bundle_has_content(data):
         return data
@@ -510,6 +562,11 @@ def _hydrate_clawhub_payload(
 def _normalize_bundle(
     data: Any,
 ) -> tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    # `_normalize_bundle` 的目标是把“来自不同 hub/下载器”的原始 JSON/中间结构
+    # 统一成 `SkillService.create_skill` 需要的五元组：
+    # (name, content, references_tree, scripts_tree, extra_files_tree)。
+    #
+    # 其中 references/scripts 是树状 dict（嵌套目录映射），extra_files 用于写到技能根目录。
     payload = data
     if isinstance(data, dict) and isinstance(data.get("skill"), dict):
         payload = data["skill"]
@@ -917,6 +974,11 @@ def _github_collect_tree_files(
     subdir: str,
     max_files: int = 200,
 ) -> dict[str, str]:
+    # 从 GitHub 仓库的特定子目录（references 或 scripts）收集文件内容。
+    #
+    # 这里之所以要：
+    # - 限制 max_files：避免极大目录导致请求风暴/耗时过长；
+    # - 只保留 references/* 与 scripts/*：其它文件通常不属于“技能运行所需结构”，且可能很大/不安全。
     files: dict[str, str] = {}
     pending = [_join_repo_path(root, subdir)]
     visited = 0
@@ -1221,6 +1283,11 @@ def _lobehub_download_url(identifier: str) -> str:
 
 
 def _lobehub_zip_to_bundle(identifier: str, payload: bytes) -> dict[str, Any]:
+    # 将 LobeHub 下载到的 zip 包解析为 bundle 结构：
+    # - 只保留少数我们需要的文件：`SKILL.md`、以及 `references/` / `scripts/` 下的文件；
+    # - 使用 LOBEHUB_MAX_ZIP_ENTRIES / LOBEHUB_MAX_ZIP_BYTES 做硬限制，避免恶意/超大压缩包拖垮服务；
+    # - 对 zip 里的相对路径进行净化（_safe_path_parts），拒绝绝对路径/路径穿越；
+    # - 非文本文件通过 `_is_probably_text_blob` 粗略过滤，减少把二进制误当脚本/markdown 写入。
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             files: dict[str, str] = {}
@@ -1339,6 +1406,7 @@ def _fetch_bundle_from_clawhub_slug(
 
 
 def search_hub_skills(query: str, limit: int = 20) -> list[HubSkillResult]:
+    # 搜索入口：调用 hub 的 search API，抓取列表项并做结构化返回。
     base = _hub_base_url()
     search_url = _join_url(base, _hub_search_path())
     data = _http_json_get(search_url, {"q": query, "limit": limit})
@@ -1372,6 +1440,11 @@ def install_skill_from_hub(
     enable: bool = True,
     overwrite: bool = False,
 ) -> HubInstallResult:
+    # 安装入口：把 `bundle_url`（技能来源的 URL）解析成具体下载方式，
+    # 最终落到：
+    # - 统一 normalize 成 bundle 数据；
+    # - 调用 SkillService.create_skill 写入 customized_skills；
+    # - enable 时同步到 active_skills。
     source_url = bundle_url
     data: Any
 

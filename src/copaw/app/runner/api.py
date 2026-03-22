@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Chat management API."""
+"""Chat management API（中文注释版）。"""
 from __future__ import annotations
 from typing import Optional
 from uuid import uuid4
@@ -17,9 +17,16 @@ from .utils import agentscope_msg_to_message
 
 router = APIRouter(prefix="/chats", tags=["chats"])
 
+# 依赖注入函数：
+# - `chat_manager`：由应用启动时初始化，并放入 `request.app.state`；
+# - `runner.session`：用于从 JSON 文件取出 agent 的 memory 状态。
 
 def get_chat_manager(request: Request) -> ChatManager:
     """Get the chat manager from app state.
+
+    中文说明：
+    该函数是 FastAPI 的 `Depends` 依赖注入入口。
+    如果应用启动阶段尚未完成 `chat_manager` 注入，则返回 503，避免后续接口空指针错误。
 
     Args:
         request: FastAPI request object
@@ -41,6 +48,10 @@ def get_chat_manager(request: Request) -> ChatManager:
 
 def get_session(request: Request) -> SafeJSONSession:
     """Get the session from app state.
+
+    中文说明：
+    通过 `request.app.state.runner` 获取 runner 实例，
+    再返回其中的 `SafeJSONSession`（负责会话 JSON 的读写）。
 
     Args:
         request: FastAPI request object
@@ -68,6 +79,10 @@ async def list_chats(
 ):
     """List all chats with optional filters.
 
+    中文说明：
+    - 不带参数时返回全部 ChatSpec；
+    - 带 `user_id`/`channel` 时将过滤条件下推到 `ChatManager -> repo.filter_chats`。
+
     Args:
         user_id: Optional user ID to filter chats
         channel: Optional channel name to filter chats
@@ -82,6 +97,10 @@ async def create_chat(
     mgr: ChatManager = Depends(get_chat_manager),
 ):
     """Create a new chat.
+
+    中文说明：
+    - `id`（UUID）由服务端生成，因此客户端不需要传入；
+    - 其它字段直接来自请求体 `ChatSpec`。
 
     Server generates chat_id (UUID) automatically.
 
@@ -111,6 +130,10 @@ async def batch_delete_chats(
 ):
     """Delete chats by chat IDs.
 
+    中文说明：
+    - 只删除 ChatSpec（UUID 映射/元信息），不删除 runner 的 JSON session 中的 agent memory；
+    - 返回 `{"deleted": bool}` 供调用方判断实际删除结果。
+
     Args:
         chat_ids: List of chat IDs
         mgr: Chat manager dependency
@@ -129,6 +152,11 @@ async def get_chat(
     session: SafeJSONSession = Depends(get_session),
 ):
     """Get detailed information about a specific chat by UUID.
+
+    中文说明：
+    这个接口把“ChatSpec（元信息）”与“JSON session 里的 agent.memory（消息内容）”合并成返回的 `ChatHistory`。
+    - 如果 session 不存在/为空：返回 `ChatHistory(messages=[])`；
+    - 否则：把 memory 里的消息结构转换成可展示 messages。
 
     Args:
         chat_id: Chat UUID
@@ -171,6 +199,11 @@ async def update_chat(
 ):
     """Update an existing chat.
 
+    中文说明：
+    - 会校验 `spec.id` 是否与 path 参数 `chat_id` 一致；
+    - 如果不一致：返回 400；
+    - 如果对应 ChatSpec 不存在：返回 404。
+
     Args:
         chat_id: Chat UUID
         spec: Updated chat specification
@@ -206,6 +239,9 @@ async def delete_chat(
     mgr: ChatManager = Depends(get_chat_manager),
 ):
     """Delete a chat by UUID.
+
+    中文说明：
+    删除的是 ChatSpec 记录（UUID 映射），不会删除 JSONSession 中的 agent.memory（聊天历史）。
 
     Note: This only deletes the chat spec (UUID mapping).
     JSONSession state is NOT deleted.

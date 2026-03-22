@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Skills management: sync skills from code to working_dir."""
+"""Skills management: sync skills from code to working_dir.
+
+中文说明：
+该模块负责“技能目录”的同步与技能文件的结构化读写，核心围绕三层目录：
+- builtin_skills：随代码发布的内置技能（`src/copaw/agents/skills/...` 里）。
+- customized_skills：用户/导入 hub 后的自定义技能（通常可写）。
+- active_skills：运行时启用的技能集合（用于 agent 实际加载）。
+
+主要能力：
+1) 同步：把 `builtin/customized` 同步到 `active_skills`（支持 force=覆盖）。
+2) 反向同步：把 `active_skills` 与 `customized_skills` 做一致化（用于 enable/disable 等行为保持 UI/API 与运行状态一致）。
+3) 结构化读写：把 `SKILL.md`、`references/`、`scripts/` 之间的目录树，序列化/反序列化为嵌套 dict（便于通过 API 创建/导入技能）。
+"""
 
 import filecmp
 import logging
@@ -231,6 +243,9 @@ def sync_skills_to_working_dir(
     Returns:
         Tuple of (synced_count, skipped_count).
     """
+    # builtin/customized 的合并逻辑：
+    # - 默认情况下：customized 中同名技能会覆盖 builtin（用于用户/导入技能优先级）。
+    # - 如果只想同步部分技能，则通过 skill_names 做过滤。
     builtin_skills = get_builtin_skills_dir()
     customized_skills = get_customized_skills_dir()
     active_skills = get_active_skills_dir()
@@ -246,7 +261,7 @@ def sync_skills_to_working_dir(
             builtin_skills,
         )
 
-    # Customized skills override builtin with same name
+    # customized override builtin with same name
     skills_to_sync.update(_collect_skills_from_dir(customized_skills))
 
     # Filter by skill_names if specified
@@ -269,6 +284,8 @@ def sync_skills_to_working_dir(
         target_dir = active_skills / skill_name
 
         # Check if skill already exists
+        # - target 已存在且 force=False：跳过（避免无意义 I/O）
+        # - force=True：先删除再 copy（确保目录内容完全覆盖）
         if target_dir.exists() and not force:
             logger.debug(
                 "Skill '%s' already exists in active_skills, skipping. "
@@ -329,6 +346,8 @@ def sync_skills_from_active_to_customized(
 
         if skill_name in builtin_skills_dict:
             builtin_skill_dir = builtin_skills_dict[skill_name]
+            # 如果 active 中的技能内容与 builtin（忽略运行时生成物）完全一致，
+            # 那么没有必要把 active 再写回 customized（避免无意义覆盖/刷盘）。
             if _directories_match_ignoring_runtime_artifacts(
                 skill_dir,
                 builtin_skill_dir,
@@ -544,6 +563,10 @@ class SkillService:
             List of SkillInfo with name, content, source, and path.
         """
         try:
+            # 在列举“全部技能”时会先做一次 active->customized 的一致化同步：
+            # - 如果某些技能在运行中/上一轮启停过程中对 active 进行了改动，
+            #   那么 enable/disable 的“真实可用状态”需要反映到 UI/API 展示；
+            # - 同步失败不会阻断列举，只记录 debug（保持列表 API 的可用性）。
             synced, _ = sync_skills_from_active_to_customized()
             if synced > 0:
                 logger.debug(
@@ -560,6 +583,8 @@ class SkillService:
 
         # Collect from builtin and customized skills. Customized skills
         # override built-in skills with the same name in the UI/API listing.
+        # 具体表现为：先读 builtin，再读 customized，最后用
+        # `_dedupe_skills_by_name` 保留同名技能中 customized 的那份数据。
         skills.extend(
             _read_skills_from_dir(get_builtin_skills_dir(), "builtin"),
         )
@@ -633,6 +658,11 @@ class SkillService:
             )
         """
         # Validate SKILL.md content has required YAML Front Matter
+        # 中文说明：
+        # `SKILL.md` 不是纯文本：必须在顶部提供 YAML front matter，
+        # 至少包含 `name` 与 `description` 两个字段。
+        # 这两个字段会直接影响 UI/API 展示的技能名称与描述，
+        # 因此在写入磁盘前先做校验，避免保存“格式不正确的技能包”。
         try:
             post = frontmatter.loads(content)
             skill_name = post.get("name", None)
@@ -730,6 +760,8 @@ class SkillService:
         Returns:
             True if skill was disabled successfully, False otherwise.
         """
+        # disable 的语义：从 active_skills 移除该技能目录，
+        # 使其不再被 agent 加载（builtin/customized 仍保留，用于之后 enable）。
         active_dir = get_active_skills_dir()
         skill_dir = active_dir / name
 
@@ -764,6 +796,9 @@ class SkillService:
         Returns:
             True if skill was enabled successfully, False otherwise.
         """
+        # enable 的语义：把（builtin + customized 中）同名技能同步到 active_skills。
+        # - 如果 force=False：active_skills 已存在则直接跳过；
+        # - force=True：会先删除 active 目录再 copy，确保覆盖一致。
         sync_skills_to_working_dir(skill_names=[name], force=force)
         # Check if skill was actually synced
         active_dir = get_active_skills_dir()
@@ -785,6 +820,9 @@ class SkillService:
         Returns:
             True if skill was deleted successfully, False otherwise.
         """
+        # delete 的对象只在 customized_skills：builtin 不可删除。
+        # 若该技能当前已 enable，则它仍可能存在于 active_skills，
+        # 直到用户手动 disable（与文档语义一致）。
         customized_dir = get_customized_skills_dir()
         skill_dir = customized_dir / name
 
@@ -883,6 +921,9 @@ class SkillService:
             return None
 
         # Prevent path traversal attacks
+        # 中文说明：
+        # 只允许在 skills 的 `references/` 或 `scripts/` 目录下读取文件，
+        # 并且禁止包含 ".." 或绝对路径（以避免通过相对路径跳出技能目录读取任意磁盘文件）。
         if ".." in normalized or normalized.startswith("/"):
             logger.error(
                 "Invalid file_path '%s': path traversal not allowed",

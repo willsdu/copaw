@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+runner 模块工具函数（中文注释版）。
+
+本文件主要做两件事：
+1) `build_env_context`：把“当前会话/用户/通道/工作目录”等运行时信息，拼接成喂给 LLM 的环境上下文字符串；
+2) `agentscope_msg_to_message`：把外部框架（agentscope）产生的消息结构（包含 text/thinking/tool_use/tool_result/image/audio 等 block）
+   转换为运行时引擎（agentscope_runtime）的 `Message` 结构，并保持必要的元信息映射。
+"""
 import json
 from datetime import datetime, timezone
 from typing import Optional, Union, List
@@ -22,6 +30,11 @@ def build_env_context(
 ) -> str:
     """
     Build environment context with current request context prepended.
+
+    中文说明：
+    - 该函数会生成一段固定格式的文本，把“当前 UTC 时间”和“请求上下文”作为前缀提供给模型；
+    - 若 `add_hint=True`，会附带一段重要提示（例如：优先使用 skills、写文件前先 read_file 等），
+      用于降低模型直接操作文件/工具时的误用风险。
 
     Args:
         session_id: Current session ID
@@ -68,6 +81,13 @@ def agentscope_msg_to_message(
     """
     Convert AgentScope Msg(s) into one or more runtime Message objects
 
+    中文说明：
+    agentscope 的 `Msg` 可能包含多种 block（纯文本、思考、工具调用、工具结果、图片、音频等）。
+    为了让运行时引擎能够正确渲染/路由这些内容，本函数会：
+    - 对每个 block 按“高层消息类型”进行分组/拆分；
+    - 为需要时创建新的 `MessageBuilder`（例如 tool_use/tool_result 需要分别映射到 PLUGIN_CALL / PLUGIN_CALL_OUTPUT）；
+    - 将 messages 的 `id/name/metadata` 等元信息保存到 runtime message metadata 中，便于后续追踪来源。
+
     Args:
         messages: AgentScope message(s) from streaming.
 
@@ -87,13 +107,14 @@ def agentscope_msg_to_message(
         role = msg.role or "assistant"
 
         if isinstance(msg.content, str):
-            # Only text
+            # 只有纯文本内容：直接生成 MESSAGE 类型
             rb = ResponseBuilder()
             mb = rb.create_message_builder(
                 role=role,
                 message_type=MessageType.MESSAGE,
             )
-            # add meta field to store old id and name
+            # 元信息：保留 agentscope 原始的 id/name/metadata
+            # （后续在渲染/追踪时可以把 runtime message 映射回上游消息来源）。
             mb.message.metadata = {
                 "original_id": msg.id,
                 "original_name": msg.name,
@@ -107,7 +128,7 @@ def agentscope_msg_to_message(
             continue
 
         # msg.content is a list of blocks
-        # We group blocks by high-level message type
+        # 按“高层消息类型”分组 blocks：例如文本/推理/工具调用需要分别落到不同的 MessageType
         current_mb = None
         current_type = None
 
@@ -118,7 +139,7 @@ def agentscope_msg_to_message(
                 continue
 
             if btype == "text":
-                # Create/continue MESSAGE type
+                # text：映射为 MessageType.MESSAGE（普通回答文本）
                 if current_type != MessageType.MESSAGE:
                     if current_mb:
                         current_mb.complete()
@@ -140,7 +161,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             elif btype == "thinking":
-                # Create/continue REASONING type
+                # thinking：映射为 MessageType.REASONING（模型推理/思考段落）
                 if current_type != MessageType.REASONING:
                     if current_mb:
                         current_mb.complete()
@@ -162,7 +183,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             elif btype == "tool_use":
-                # Always start a new PLUGIN_CALL message
+                # tool_use：映射到 PLUGIN_CALL；并且“总是”开启一个新的插件调用消息
                 if current_mb:
                     current_mb.complete()
                     results.append(current_mb.get_message_data())
@@ -197,7 +218,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             elif btype == "tool_result":
-                # Always start a new PLUGIN_CALL_OUTPUT message
+                # tool_result：映射到 PLUGIN_CALL_OUTPUT；并且“总是”开启一个新的插件调用输出消息
                 if current_mb:
                     current_mb.complete()
                     results.append(current_mb.get_message_data())
@@ -232,7 +253,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             elif btype == "image":
-                # Create/continue MESSAGE type with image
+                # image：映射为 MESSAGE，并使用 content_type="image"
                 if current_type != MessageType.MESSAGE:
                     if current_mb:
                         current_mb.complete()
@@ -275,7 +296,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             elif btype == "audio":
-                # Create/continue MESSAGE type with audio
+                # audio：映射为 MESSAGE，并使用 content_type="audio"
                 if current_type != MessageType.MESSAGE:
                     if current_mb:
                         current_mb.complete()
@@ -328,7 +349,7 @@ def agentscope_msg_to_message(
                 cb.complete()
 
             else:
-                # Fallback to MESSAGE type
+                # 未知/兜底 block：退回为 MESSAGE，尽可能把 block 转成文本展示
                 if current_type != MessageType.MESSAGE:
                     if current_mb:
                         current_mb.complete()

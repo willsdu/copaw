@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Daemon command execution layer and DaemonCommandHandlerMixin.
+"""Daemon command execution layer and DaemonCommandHandlerMixin（中文注释版）。
 
 Shared by in-chat /daemon <sub> and CLI `copaw daemon <sub>`.
 Logs: tail WORKING_DIR / "copaw.log". Restart: in-process reload of channels,
 cron and MCP (no process exit); works on Mac/Windows without a process manager.
+
+中文说明：
+- 用于在“聊天对话内”或“CLI”中执行管理类命令；
+- 通过 in-process 重载（不退出进程）实现 restart 的轻量化；
+- logs 子命令会读取 `WORKING_DIR / copaw.log` 的尾部内容返回给用户。
 """
 # pylint: disable=too-many-return-statements
 from __future__ import annotations
@@ -62,6 +67,10 @@ def _get_last_lines(
 ) -> str:
     """Read last N lines from a text file (tail) with bounded memory.
 
+    中文说明：
+    - 读取尾部日志时使用 `max_bytes` 限制，避免日志文件过大导致内存占用/延迟；
+    - 若文件过大，只读取最后 `max_bytes` 字节，再取最后 `lines` 行返回。
+
     Reads at most max_bytes from the end of the file so large logs
     do not cause high memory usage or latency.
     """
@@ -92,6 +101,8 @@ def _get_last_lines(
 
 def run_daemon_status(context: DaemonContext) -> str:
     """Return status text (health, config, memory_manager)."""
+    # 该函数只做“信息拼装”：不执行重载、不触碰 agent/rerun，
+    # 主要用于让用户快速确认配置是否加载、内存管理是否挂载成功。
     parts = ["**Daemon Status**", ""]
     try:
         cfg = context.load_config_fn()
@@ -116,6 +127,8 @@ def run_daemon_status(context: DaemonContext) -> str:
 
 async def run_daemon_restart(context: DaemonContext) -> str:
     """Trigger in-process restart (channels, cron, MCP) or instruct user."""
+    # restart 的核心：如果注入了 restart_callback，则由回调在当前进程内完成重载；
+    # 否则返回提示，让用户使用外部工具/进程管理器来重启服务。
     if context.restart_callback is not None:
         try:
             await context.restart_callback()
@@ -141,6 +154,8 @@ async def run_daemon_restart(context: DaemonContext) -> str:
 
 def run_daemon_reload_config(context: DaemonContext) -> str:
     """Reload config (re-call load_config); no process restart."""
+    # reload-config：只重新调用 `load_config()` 用于刷新配置对象，
+    # 不会触发 channels/cron/MCP 的重载（与 restart 区别在这里）。
     try:
         context.load_config_fn()
         return (
@@ -152,6 +167,7 @@ def run_daemon_reload_config(context: DaemonContext) -> str:
 
 def run_daemon_version(context: DaemonContext) -> str:
     """Return version and paths."""
+    # version：当前版本号来源于 `...__version__`，若找不到则回退为 unknown。
     try:
         from ...__version__ import __version__ as ver
     except ImportError:
@@ -166,6 +182,7 @@ def run_daemon_version(context: DaemonContext) -> str:
 
 def run_daemon_logs(context: DaemonContext, lines: int = 100) -> str:
     """Tail last N lines from WORKING_DIR / copaw.log."""
+    # 直接返回给用户的内容会被包裹成代码块，便于复制/阅读。
     log_path = context.working_dir / "copaw.log"
     content = _get_last_lines(log_path, lines=lines)
     return f"**Console log (last {lines} lines)**\n\n```\n{content}\n```"
@@ -176,6 +193,11 @@ async def run_daemon_approve(
     session_id: str = "",
 ) -> str:
     """Resolve the pending tool-guard approval for *session_id*.
+
+    中文说明：
+    - tool-guard 审批链路允许用户以 `/daemon approve` 结束“等待审批”的状态；
+    - runner 在多数情况下会先拦截消息走主审批流程，但这里仍保留兜底实现：
+      如果系统当前并没有 pending 请求，则返回“没有待审批”的提示。
 
     Called when the user sends ``/daemon approve`` in the chat while a
     tool-guard approval is pending.  The runner intercepts the message
@@ -213,6 +235,10 @@ async def run_daemon_approve(
 
 def parse_daemon_query(query: str) -> Optional[tuple[str, list[str]]]:
     """Parse /daemon <sub> or /<short>. Return (subcommand, args) or None."""
+    # 支持两种写法：
+    # - 全称：`/daemon status`、`/daemon restart`...
+    # - 短命令：`/status`、`/restart`、`/logs 200`（可带参数）
+    # 返回 (subcommand, args)，用于后续路由到具体执行函数。
     if not query or not isinstance(query, str):
         return None
     raw = query.strip()
@@ -253,6 +279,8 @@ class DaemonCommandHandlerMixin:
         context: DaemonContext,
     ) -> Msg:
         """Run daemon subcommand; return a single assistant Msg."""
+        # 该 handler 总是返回一个单独的 `assistant Msg`，
+        # 让上层对话流把输出作为“模型消息”渲染给用户。
         parsed = parse_daemon_query(query)
         if not parsed:
             return Msg(

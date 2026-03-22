@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Write query-handler error log and agent/memory state to a temp JSON file."""
+"""Write query-handler error log and agent/memory state to a temp JSON file（中文注释版）。"""
 from __future__ import annotations
 
 import json
@@ -14,9 +14,16 @@ from ..channels.schema import DEFAULT_CHANNEL
 
 logger = logging.getLogger(__name__)
 
+#
+# 该模块的目标是：当 `query_handler` 在处理用户请求时发生异常，
+# 把“人类可读的 trace + 可机器读取的上下文信息（请求、agent_state）”落盘，
+# 以便后续离线分析/复现。
+#
 
 def _safe_json_serialize(obj: object) -> object:
     """Convert object to JSON-serializable form; use str() for unknowns."""
+    # JSON 原生只能处理少量类型（dict/list/str/number/bool/None）。
+    # 对于其它类型（例如 datetime、pydantic 模型等），这里用 `str(obj)` 保底。
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     if isinstance(obj, (list, tuple)):
@@ -28,6 +35,8 @@ def _safe_json_serialize(obj: object) -> object:
 
 def _request_to_dict(request: Any) -> Any:
     """Serialize request to a JSON-serializable dict (Pydantic or vars)."""
+    # request 可能是 Pydantic 对象，也可能是简单对象（vars 可用），
+    # 因此这里按优先级尝试 model_dump -> dict -> vars(request)。
     if request is None:
         return None
     try:
@@ -52,9 +61,16 @@ def write_query_error_dump(
 ) -> str | None:
     """Write error log, traceback and agent/memory state to a temp JSON file.
 
+    中文说明：
+    - 返回值是写入成功后的临时文件路径；
+    - 若在写入过程中再次失败（例如序列化错误、磁盘问题），则返回 None，
+      上层会继续抛出原异常（只是不再附带 dump 路径）。
+
     Returns the temp file path, or None if write failed.
     """
     try:
+        # 1) 先把 request 中的关键信息抽出来（session_id/user_id/channel）
+        # 2) 再把 request 完整对象序列化成可 JSON 的 dict
         request_info: dict[str, Any] = {}
         request_full: dict[str, Any] | None = None
         if request is not None:
@@ -66,6 +82,7 @@ def write_query_error_dump(
             request_full = _request_to_dict(request)
         trace_str = traceback.format_exc()
         agent_state = None
+        # 这里从 locals_ 里尝试拿到上层的 `agent`，以便保存 agent.state_dict()
         agent = locals_.get("agent")
         if agent is not None:
             try:

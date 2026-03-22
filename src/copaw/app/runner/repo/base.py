@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Chat repository for storing chat/session specs."""
+"""Chat repository for storing chat/session specs（中文注释版）。"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -11,6 +11,9 @@ from ...channels.schema import DEFAULT_CHANNEL
 
 class BaseChatRepository(ABC):
     """Abstract repository for chat specs persistence."""
+    # 说明：
+    # 该类定义了“聊天规格（ChatSpec）如何持久化”的抽象接口。
+    # runner 的其他层（ChatManager、API）只依赖这些方法，而不关心底层存储介质。
 
     @abstractmethod
     async def load(self) -> ChatsFile:
@@ -26,6 +29,8 @@ class BaseChatRepository(ABC):
 
     async def list_chats(self) -> list[ChatSpec]:
         """List all chat specifications."""
+        # 通过 load() 把全部 ChatSpec 拉取出来后返回；
+        # 由于不同仓库实现可能有不同性能特征，这里提供一个统一的便利方法。
         cf = await self.load()
         return cf.chats
 
@@ -38,6 +43,8 @@ class BaseChatRepository(ABC):
         Returns:
             ChatSpec or None if not found
         """
+        # 这里采用遍历查找：对于单文件 JSON 仓库足够简单；
+        # 若仓库实现更高效（例如 DB/Redis），可以在子类里重写以提升性能。
         cf = await self.load()
         for chat in cf.chats:
             if chat.id == chat_id:
@@ -60,6 +67,8 @@ class BaseChatRepository(ABC):
         Returns:
             ChatSpec or None if not found
         """
+        # 说明：这里的命中条件是 (session_id, user_id, channel) 三元组；
+        # 其中 session_id 通常由上层按 channel:user_id 格式组织。
         cf = await self.load()
         for chat in cf.chats:
             if (
@@ -76,6 +85,9 @@ class BaseChatRepository(ABC):
         Args:
             spec: Chat specification to upsert
         """
+        # upsert 语义：
+        # - 若已有相同 id 的 ChatSpec，则替换；
+        # - 否则追加到 chats 列表中。
         cf = await self.load()
         for i, c in enumerate(cf.chats):
             if c.id == spec.id:
@@ -94,6 +106,8 @@ class BaseChatRepository(ABC):
         Returns:
             True if deleted, False if not found
         """
+        # 删除的粒度是 chat_id（即 ChatSpec.id）。
+        # 返回值用于让 API 层区分“找到了并删除”与“没找到”。 
         if not chat_ids:
             return False
 
@@ -119,6 +133,9 @@ class BaseChatRepository(ABC):
         Returns:
             Filtered list of chat specs
         """
+        # 过滤逻辑是“逐条件缩小结果集”：
+        # - 若 user_id 不为 None，则只保留匹配的；
+        # - 若 channel 不为 None，则只保留匹配的。
         cf = await self.load()
         results = cf.chats
 
